@@ -1,4 +1,5 @@
-# GBPJPY SLP BOT V5 - REPLIT VERSION
+
+# GBPJPY SLP BOT V5 - FIXED FOR RENDER
 import os, time, threading, requests
 import yfinance as yf
 import pandas as pd
@@ -17,6 +18,27 @@ def send(msg):
     except Exception as e:
         print(e)
 
+def get_session():
+    try:
+        from curl_cffi import requests as cffi_requests
+        return cffi_requests.Session(impersonate="chrome")
+    except Exception as e:
+        print("curl_cffi not found, using default:", e)
+        return None
+
+def download(ticker, interval, period):
+    for attempt in range(3):
+        try:
+            session = get_session()
+            df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=True, session=session, threads=False)
+            if df is not None and not df.empty:
+                return df
+            print(f"Empty data attempt {attempt+1} for {interval}")
+        except Exception as e:
+            print(f"Download fail {attempt+1} {interval}:", e)
+        time.sleep(5)
+    return None
+
 def fix(df):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -26,14 +48,17 @@ def fix(df):
 def check():
     try:
         print("Checking...", datetime.now())
-        df30 = yf.download("GBPJPY=X", interval="30m", period="60d", progress=False, auto_adjust=True)
+        df30 = download("GBPJPY=X", "30m", "60d")
+        if df30 is None: print("No 30m data, skip"); return
         df30 = fix(df30)
         try: df30.index = df30.index.tz_convert('Africa/Lagos')
         except: pass
-        df1h = yf.download("GBPJPY=X", interval="1h", period="6mo", progress=False, auto_adjust=True)
+        df1h = download("GBPJPY=X", "1h", "6mo")
+        if df1h is None: print("No 1h data, skip"); return
         df1h = fix(df1h)
         df4h = df1h.resample('4h').agg({'Open':'first','High':'max','Low':'min','Close':'last'}).dropna()
-        df1d = yf.download("GBPJPY=X", interval="1d", period="6mo", progress=False, auto_adjust=True)
+        df1d = download("GBPJPY=X", "1d", "6mo")
+        if df1d is None: print("No 1d data, skip"); return
         df1d = fix(df1d)
         df1d['EMA20'] = df1d['Close'].ewm(span=20).mean()
         bias = "Bullish" if float(df1d['Close'].iloc[-1]) > float(df1d['EMA20'].iloc[-1]) else "Bearish"
@@ -72,8 +97,27 @@ def check():
     except Exception as e:
         print("Error:", e)
 
+# Reply to /start
+def telegram_poll():
+    offset = None
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+            params = {"timeout": 30}
+            if offset: params["offset"] = offset
+            r = requests.get(url, params=params, timeout=35).json()
+            for u in r.get("result", []):
+                offset = u["update_id"] + 1
+                msg = u.get("message", {})
+                text = msg.get("text", "")
+                if text == "/start":
+                    send("✅ Bot is online! I go send GBPJPY SLP signals 8am-6pm Lagos when setup appear.")
+        except Exception as e:
+            print("Poll error:", e)
+            time.sleep(5)
+
 def loop():
-    send("✅ *GBJPY SLP Bot is LIVE on Replit*\nChecking every 30 mins, 8am-6pm Lagos.")
+    send("✅ *GBJPY SLP Bot is LIVE on Render*\nChecking every 30 mins, 8am-6pm Lagos.")
     while True:
         check()
         time.sleep(1800)
@@ -81,5 +125,8 @@ def loop():
 @app.route('/')
 def home(): return "Bot Running!"
 
-threading.Thread(target=loop, daemon=True).start()
-app.run(host='0.0.0.0', port=8080)
+if __name__ == "__main__":
+    threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=telegram_poll, daemon=True).start()
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
