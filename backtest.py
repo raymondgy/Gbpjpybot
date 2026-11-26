@@ -1,10 +1,7 @@
-# GBPJPY SLP BACKTESTER - V2
-# Tests the exact same logic as main.py on last 6 months
-
+# GBPJPY SLP BACKTESTER - V3 LOOSE
 import os
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
 
 API_KEY = os.getenv("TWELVE_API_KEY")
 SYMBOL = "GBP/JPY"
@@ -23,186 +20,163 @@ def get_data(interval, outputsize=5000):
     df = df.sort_values("datetime").reset_index(drop=True)
     return df
 
+def get_swing(df, lookback=3):
+    highs = []
+    lows = []
+    for i in range(lookback, len(df)-lookback):
+        if df["high"].iloc[i] == df["high"].iloc[i-lookback:i+lookback+1].max():
+            highs.append(df["high"].iloc[i])
+        if df["low"].iloc[i] == df["low"].iloc[i-lookback:i+lookback+1].min():
+            lows.append(df["low"].iloc[i])
+    return highs, lows
+
 def run_backtest():
-    print("Fetching data for backtest... This fit take 30s")
+    print("Fetching data...")
     df_1d = get_data("1day", 200)
     df_4h = get_data("4h", 1000)
     df_30m = get_data("30min", 5000)
-
-    if df_1d is None or df_30m is None:
-        print("Failed to get data")
-        return
-
-    print(f"Got {len(df_30m)} x 30M candles, {len(df_1d)} x Daily candles")
+    print(f"Got {len(df_30m)} x 30M candles")
     print(f"Range: {df_30m['datetime'].iloc[0]} to {df_30m['datetime'].iloc[-1]}")
 
     trades = []
-    # We go loop through 30M candles, start from candle 100 to get history
-    for i in range(100, len(df_30m)-50):
+    # Loop with step 5 to avoid double count
+    i = 100
+    while i < len(df_30m)-60:
         current_time = df_30m["datetime"].iloc[i]
-        current_price = df_30m["close"].iloc[i]
-
-        # 1. Get 1D Bias at that time - last 3 daily candles before current_time
+        
+        # 1D Bias
         daily_before = df_1d[df_1d["datetime"] <= current_time]
         if len(daily_before) < 3:
+            i += 1
             continue
         last_closes = daily_before["close"].tail(3).values
-        bias = "Bullish" if last_closes[-1] > last_closes[0] else "Bearish" if last_closes[-1] < last_closes[0] else "Range"
+        bias = "Bullish" if last_closes[-1] > last_closes[0] else "Bearish"
 
-        # 2. Get 4H Liquidity at that time
+        # 4H Levels - Use last swing, not absolute max
         fourh_before = df_4h[df_4h["datetime"] <= current_time]
-        if len(fourh_before) < 20:
+        if len(fourh_before) < 30:
+            i += 1
             continue
-        # Last swing low/high = lowest low / highest high of last 20 4H candles
-        last_4h_low = fourh_before["low"].tail(20).min()
-        last_4h_high = fourh_before["high"].tail(20).max()
+        h4_highs, h4_lows = get_swing(fourh_before.tail(50))
+        if not h4_highs or not h4_lows:
+            i += 1
+            continue
+        last_4h_high = h4_highs[-1]
+        last_4h_low = h4_lows[-1]
 
-        # 3. Check for SLP in last 10 candles
-        window = df_30m.iloc[i-10:i+1]
+        # Look for setup in last 20 candles - LOOSER
+        window = df_30m.iloc[i-20:i+1]
         signal = None
         setup = ""
         entry = sl = tp1 = tp2 = None
 
-        # CONTINUATION BUY: Sweep 4H Low, close back above, then MSS
+        # BUY: Sweep any recent low, then MSS
         if bias == "Bullish":
-            for j in range(len(window)-5, len(window)):
+            # Find a recent low that got swept
+            for j in range(5, len(window)-2):
                 candle = window.iloc[j]
-                if candle["low"] < last_4h_low and candle["close"] > last_4h_low:
-                    # Sweep found, check MSS in next candles
+                # Sweep = low below previous low, close back above previous low
+                prev_low = window.iloc[j-3:j]["low"].min()
+                if candle["low"] < prev_low and candle["close"] > prev_low:
+                    # Check MSS: close above last lower high
                     last_lh = window.iloc[max(0,j-5):j]["high"].max()
                     for k in range(j+1, len(window)):
                         if window["close"].iloc[k] > last_lh:
-                            # MSS confirmed
-                            entry = window["low"].iloc[k-1]  # OB low
+                            entry = window["close"].iloc[k]  # Enter on MSS close, simpler
                             sweep_low = candle["low"]
-                            if (entry - sweep_low)*100 > 50: # Sweep too big
+                            if (entry - sweep_low)*100 > 80:  # Allow bigger sweep now
                                 break
                             sl = sweep_low - 0.10
                             tp1 = last_4h_high
+                            # If TP1 too close, skip
+                            if (tp1 - entry)*100 < 15:
+                                break
                             risk = entry - sl
                             tp2 = entry + (risk*3)
                             signal = "BUY"
-                            setup = "CONTINUATION BUY"
+                            setup = "BUY SLP"
                             break
-                    break
+                    if signal:
+                        break
 
-        # CONTINUATION SELL
+        # SELL: Mirror
         if bias == "Bearish" and not signal:
-            for j in range(len(window)-5, len(window)):
+            for j in range(5, len(window)-2):
                 candle = window.iloc[j]
-                if candle["high"] > last_4h_high and candle["close"] < last_4h_high:
+                prev_high = window.iloc[j-3:j]["high"].max()
+                if candle["high"] > prev_high and candle["close"] < prev_high:
                     last_hl = window.iloc[max(0,j-5):j]["low"].min()
                     for k in range(j+1, len(window)):
                         if window["close"].iloc[k] < last_hl:
-                            entry = window["high"].iloc[k-1]
+                            entry = window["close"].iloc[k]
                             sweep_high = candle["high"]
-                            if (sweep_high - entry)*100 > 50:
+                            if (sweep_high - entry)*100 > 80:
                                 break
                             sl = sweep_high + 0.10
                             tp1 = last_4h_low
+                            if (entry - tp1)*100 < 15:
+                                break
                             risk = sl - entry
                             tp2 = entry - (risk*3)
                             signal = "SELL"
-                            setup = "CONTINUATION SELL"
+                            setup = "SELL SLP"
                             break
-                    break
+                    if signal:
+                        break
 
         if not signal:
+            i += 1
             continue
 
-        # 4. Simulate Trade - Check next 50 candles wetin happen
-        future = df_30m.iloc[i+1:i+50]
+        # Simulate next 60 candles
+        future = df_30m.iloc[i+1:i+60]
         result = "NO RESULT"
         r_result = 0
-        exit_price = entry
-        
         for _, fut in future.iterrows():
             if signal == "BUY":
                 if fut["low"] <= sl:
-                    result = "LOSS"
-                    r_result = -1
-                    exit_price = sl
-                    break
+                    result = "LOSS"; r_result = -1; break
                 if fut["high"] >= tp2:
-                    result = "WIN TP2"
-                    r_result = 3
-                    exit_price = tp2
-                    break
-                if fut["high"] >= tp1:
-                    # If e hit TP1, we go take partial, but for backtest we count as WIN TP1 = 1.5R
-                    # Continue to see if e go hit TP2 or SL
-                    pass
-            else: # SELL
-                if fut["high"] >= sl:
-                    result = "LOSS"
-                    r_result = -1
-                    exit_price = sl
-                    break
-                if fut["low"] <= tp2:
-                    result = "WIN TP2"
-                    r_result = 3
-                    exit_price = tp2
-                    break
-
-        # If e never hit SL or TP2 in 50 candles, check TP1
-        if result == "NO RESULT":
-            # Check if TP1 was hit at all
-            if signal == "BUY" and future["high"].max() >= tp1:
-                result = "WIN TP1"
-                r_result = 1.5
-            elif signal == "SELL" and future["low"].min() <= tp1:
-                result = "WIN TP1"
-                r_result = 1.5
+                    result = "WIN TP2"; r_result = 3; break
             else:
-                result = "BREAKEVEN / TIMEOUT"
-                r_result = 0
+                if fut["high"] >= sl:
+                    result = "LOSS"; r_result = -1; break
+                if fut["low"] <= tp2:
+                    result = "WIN TP2"; r_result = 3; break
+        if result == "NO RESULT":
+            if signal == "BUY" and future["high"].max() >= tp1:
+                result = "WIN TP1"; r_result = 1.5
+            elif signal == "SELL" and future["low"].min() <= tp1:
+                result = "WIN TP1"; r_result = 1.5
+            else:
+                result = "TIMEOUT"; r_result = 0
 
-        trades.append({
-            "time": current_time,
-            "bias": bias,
-            "setup": setup,
-            "signal": signal,
-            "entry": round(entry, 2),
-            "sl": round(sl, 2),
-            "tp1": round(tp1, 2),
-            "tp2": round(tp2, 2),
-            "result": result,
-            "R": r_result
-        })
-        # Skip ahead 20 candles so we no double-count same setup
-        # This na to avoid same signal repeating
-        # We go jump i forward by using a trick: set i via loop break not possible, so we just continue but next signals go overlap small
+        trades.append({"time": current_time, "bias": bias, "setup": setup, "signal": signal, "entry": round(entry,2), "sl": round(sl,2), "tp1": round(tp1,2), "tp2": round(tp2,2), "result": result, "R": r_result})
+        i += 20  # Jump 20 candles to avoid same trade repeating
+        continue
 
-    # --- RESULTS ---
     if not trades:
-        print("\n❌ No trades found in backtest. Strategy too strict or data small.")
+        print("\n❌ Still no trades. Data issue.")
         return
 
     df_trades = pd.DataFrame(trades)
     total = len(df_trades)
     wins = len(df_trades[df_trades["R"] > 0])
     losses = len(df_trades[df_trades["R"] < 0])
-    win_rate = (wins / total) * 100
+    win_rate = (wins/total)*100
     total_r = df_trades["R"].sum()
     avg_r = df_trades["R"].mean()
-    profit_factor = df_trades[df_trades["R"]>0]["R"].sum() / abs(df_trades[df_trades["R"]<0]["R"].sum()) if losses>0 else 999
-
     print("\n" + "="*50)
-    print("📊 GBPJPY SLP BACKTEST RESULTS")
+    print("📊 GBPJPY SLP BACKTEST V3 RESULTS")
     print("="*50)
     print(f"Total Trades: {total}")
     print(f"Wins: {wins} | Losses: {losses}")
     print(f"Win Rate: {win_rate:.1f}%")
     print(f"Total R: {total_r:.1f}R")
-    print(f"Avg R per trade: {avg_r:.2f}R")
-    print(f"Profit Factor: {profit_factor:.2f}")
+    print(f"Avg R: {avg_r:.2f}R")
     print("="*50)
-    print("\nLast 10 Trades:")
-    print(df_trades.tail(10).to_string(index=False))
-
-    # Save to CSV
+    print(df_trades.tail(15).to_string(index=False))
     df_trades.to_csv("backtest_results.csv", index=False)
-    print("\n✅ Saved to backtest_results.csv")
 
 if __name__ == "__main__":
     run_backtest()
